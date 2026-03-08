@@ -208,6 +208,49 @@ def init_db():
         """)
         conn.commit()
 
+def normalize_ip_candidate(value: str):
+    """
+    Accepts values like:
+      73.183.115.144
+      73.183.115.144:3168
+      [2001:db8::1]:443
+      2001:db8::1
+    Returns just the IP portion, or None.
+    """
+    if not value:
+        return None
+
+    value = value.strip()
+
+    # Bracketed IPv6 with optional port: [2001:db8::1]:443
+    if value.startswith("["):
+        end = value.find("]")
+        if end != -1:
+            return value[1:end]
+
+    # First try whole value as-is
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+
+    # IPv4 with port: 1.2.3.4:5678
+    if value.count(":") == 1 and "." in value:
+        host = value.rsplit(":", 1)[0]
+        try:
+            ipaddress.ip_address(host)
+            return host
+        except ValueError:
+            pass
+
+    # Raw IPv6 without brackets
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        return None
+
 def is_public_ip(ip: str) -> bool:
     try:
         parsed = ipaddress.ip_address(ip)
@@ -225,33 +268,28 @@ def is_public_ip(ip: str) -> bool:
 def get_client_ip():
     """
     Prefer Azure/App Service forwarding headers.
-    In X-Forwarded-For, the first IP is typically the original client.
+    Azure may include source ports in X-Forwarded-For, so normalize first.
     """
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
-        candidates = [ip.strip() for ip in xff.split(",") if ip.strip()]
-        for ip in candidates:
+        raw_candidates = [part.strip() for part in xff.split(",") if part.strip()]
+        normalized = [normalize_ip_candidate(part) for part in raw_candidates]
+        normalized = [ip for ip in normalized if ip]
+
+        for ip in normalized:
             if is_public_ip(ip):
                 return ip
-        for ip in candidates:
-            try:
-                ipaddress.ip_address(ip)
-                return ip
-            except ValueError:
-                pass
 
-    azure_client_ip = request.headers.get("X-Azure-ClientIP")
+        if normalized:
+            return normalized[0]
+
+    azure_client_ip = normalize_ip_candidate(request.headers.get("X-Azure-ClientIP", ""))
     if azure_client_ip:
-        azure_client_ip = azure_client_ip.strip()
         if is_public_ip(azure_client_ip):
             return azure_client_ip
-        try:
-            ipaddress.ip_address(azure_client_ip)
-            return azure_client_ip
-        except ValueError:
-            pass
+        return azure_client_ip
 
-    remote = request.remote_addr
+    remote = normalize_ip_candidate(request.remote_addr or "")
     if remote:
         return remote
 
@@ -319,10 +357,6 @@ def format_asn_summary(asn_data):
     return asn_data.get("note")
 
 def get_tor_exit_ips(force_refresh=False):
-    """
-    Fetch Tor exit list and cache it for 1 hour.
-    If fetch fails, return stale cache if available.
-    """
     now = time.time()
     cache_age = now - TOR_EXIT_CACHE["fetched_at"]
 
@@ -354,10 +388,6 @@ def is_tor_exit_node(ip):
     return ip in tor_ips
 
 def classify_network(ip, asn_data):
-    """
-    Best-effort heuristic classification.
-    This is intentionally conservative and should be treated as a guess.
-    """
     result = {
         "network_type": "Unknown",
         "confidence": "low",
@@ -572,4 +602,4 @@ def tor_status():
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=False) Oh
+    app.run(host="0.0.0.0", port=5000, debug=False)
