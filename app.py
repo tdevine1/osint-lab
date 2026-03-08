@@ -11,6 +11,7 @@ import requests
 from ipwhois import IPWhois
 
 app = Flask(__name__)
+APP_VERSION = "v3-debug-2026-03-07"
 DB = "osint_lab.db"
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "change-this-now")
 
@@ -521,7 +522,7 @@ def landing():
         ))
         conn.commit()
 
-    response = make_response(render_template_string(PAGE))
+    response = make_response(render_template_string(PAGE + '<p class="small">Build: {{ app_version }}</p>', app_version=APP_VERSION))
     response.set_cookie("lab_id", cookie_id, max_age=60*60*24*30, httponly=False, samesite="Lax")
     response.set_cookie("visit_id", visit_id, max_age=60*10, httponly=False, samesite="Lax")
     return response
