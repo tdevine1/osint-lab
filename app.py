@@ -1,13 +1,26 @@
-from flask import Flask, request, jsonify, make_response, render_template_string
+from flask import Flask, request, jsonify, make_response, render_template_string, abort
 import sqlite3
 import json
 import uuid
 import ipaddress
+import os
+import time
 from datetime import datetime, timezone
+
+import requests
 from ipwhois import IPWhois
 
 app = Flask(__name__)
 DB = "osint_lab.db"
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "change-this-now")
+
+TOR_EXIT_CACHE = {
+    "fetched_at": 0,
+    "ips": set(),
+    "error": None,
+}
+
+TOR_EXIT_LIST_URL = "https://check.torproject.org/torbulkexitlist"
 
 PAGE = """
 <!doctype html>
@@ -18,36 +31,36 @@ PAGE = """
   <style>
     body {
       font-family: Arial, sans-serif;
-      max-width: 860px;
-      margin: 40px auto;
+      max-width: 980px;
+      margin: 32px auto;
       line-height: 1.5;
-      background: #fafafa;
+      background: #f7f7f7;
       color: #222;
     }
     .box {
-      border: 1px solid #a61b1b;
-      border-radius: 10px;
+      border: 1px solid #c33;
+      border-radius: 12px;
       padding: 24px;
-      background: #fff8f8;
+      background: #fff5f5;
       margin-bottom: 18px;
     }
     .panel {
       border: 1px solid #ddd;
-      border-radius: 10px;
-      padding: 18px;
+      border-radius: 12px;
+      padding: 20px;
       background: white;
-      margin-bottom: 16px;
+      margin-bottom: 18px;
     }
-    h1 { margin-top: 0; color: #a61b1b; }
+    h1 { margin-top: 0; color: #a11; }
     h2 { margin-top: 0; }
     .small { color: #555; font-size: 0.95em; }
-    code, pre {
-      background: #f4f4f4;
+    .muted { color: #666; }
+    ul { margin-top: 8px; }
+    code {
+      background: #f2f2f2;
       border-radius: 6px;
       padding: 2px 6px;
     }
-    ul { margin-top: 8px; }
-    .muted { color: #666; }
   </style>
 </head>
 <body>
@@ -72,6 +85,8 @@ PAGE = """
     <ul>
       <li><strong>Network address:</strong> <span id="ip">Loading...</span></li>
       <li><strong>Approximate network owner / ASN:</strong> <span id="asn">Loading...</span></li>
+      <li><strong>Network type guess:</strong> <span id="network_type">Loading...</span></li>
+      <li><strong>Tor exit node:</strong> <span id="tor">Loading...</span></li>
       <li><strong>Browser:</strong> <span id="ua">Loading...</span></li>
       <li><strong>Language:</strong> <span id="lang">Loading...</span></li>
       <li><strong>Timezone:</strong> <span id="tz">Loading...</span></li>
@@ -145,14 +160,21 @@ PAGE = """
         document.getElementById("ip").textContent =
           data.client_ip || "Unavailable";
 
-        if (data.asn_summary) {
-          document.getElementById("asn").textContent = data.asn_summary;
-        } else {
-          document.getElementById("asn").textContent = "Unavailable";
-        }
+        document.getElementById("asn").textContent =
+          data.asn_summary || "Unavailable";
+
+        document.getElementById("network_type").textContent =
+          data.network_type || "Unknown";
+
+        document.getElementById("tor").textContent =
+          data.is_tor_exit === true ? "Likely yes" :
+          data.is_tor_exit === false ? "No current Tor match" :
+          "Unknown";
       } catch (e) {
         document.getElementById("ip").textContent = "Unavailable";
         document.getElementById("asn").textContent = "Unavailable";
+        document.getElementById("network_type").textContent = "Unavailable";
+        document.getElementById("tor").textContent = "Unavailable";
       }
     }
 
@@ -172,57 +194,83 @@ def init_db():
                 query_string TEXT,
                 client_ip TEXT,
                 x_forwarded_for TEXT,
+                x_azure_clientip TEXT,
+                remote_addr TEXT,
                 user_agent_header TEXT,
                 accept_language TEXT,
                 referer_header TEXT,
                 cookie_id TEXT,
                 asn_json TEXT,
-                client_json TEXT
+                network_classification_json TEXT,
+                client_json TEXT,
+                headers_json TEXT
             )
         """)
         conn.commit()
 
+def is_public_ip(ip: str) -> bool:
+    try:
+        parsed = ipaddress.ip_address(ip)
+        return not (
+            parsed.is_private
+            or parsed.is_loopback
+            or parsed.is_reserved
+            or parsed.is_link_local
+            or parsed.is_multicast
+            or parsed.is_unspecified
+        )
+    except ValueError:
+        return False
+
 def get_client_ip():
     """
-    Prefer the first public IP in X-Forwarded-For.
-    Fall back to remote_addr.
+    Prefer Azure/App Service forwarding headers.
+    In X-Forwarded-For, the first IP is typically the original client.
     """
     xff = request.headers.get("X-Forwarded-For", "")
-    candidates = [ip.strip() for ip in xff.split(",") if ip.strip()]
-
-    if request.remote_addr:
-        candidates.append(request.remote_addr)
-
-    for ip in candidates:
-        try:
-            parsed = ipaddress.ip_address(ip)
-            # Keep private/reserved out if we can find a public address first
-            if not (parsed.is_private or parsed.is_loopback or parsed.is_reserved or parsed.is_link_local):
+    if xff:
+        candidates = [ip.strip() for ip in xff.split(",") if ip.strip()]
+        for ip in candidates:
+            if is_public_ip(ip):
                 return ip
-        except ValueError:
-            continue
+        for ip in candidates:
+            try:
+                ipaddress.ip_address(ip)
+                return ip
+            except ValueError:
+                pass
 
-    # If nothing public found, return first usable candidate
-    for ip in candidates:
+    azure_client_ip = request.headers.get("X-Azure-ClientIP")
+    if azure_client_ip:
+        azure_client_ip = azure_client_ip.strip()
+        if is_public_ip(azure_client_ip):
+            return azure_client_ip
         try:
-            ipaddress.ip_address(ip)
-            return ip
+            ipaddress.ip_address(azure_client_ip)
+            return azure_client_ip
         except ValueError:
-            continue
+            pass
+
+    remote = request.remote_addr
+    if remote:
+        return remote
 
     return None
 
 def enrich_ip(ip):
-    """
-    RDAP-based ASN enrichment.
-    Returns a small dict safe to store/show.
-    """
     if not ip:
         return None
 
     try:
         parsed = ipaddress.ip_address(ip)
-        if parsed.is_private or parsed.is_loopback or parsed.is_reserved or parsed.is_link_local:
+        if (
+            parsed.is_private
+            or parsed.is_loopback
+            or parsed.is_reserved
+            or parsed.is_link_local
+            or parsed.is_multicast
+            or parsed.is_unspecified
+        ):
             return {
                 "ip": ip,
                 "note": "Non-public or reserved address"
@@ -237,21 +285,16 @@ def enrich_ip(ip):
         obj = IPWhois(ip)
         result = obj.lookup_rdap(depth=1)
 
-        network_name = None
-        network_cidr = None
-        asn = result.get("asn")
-        asn_description = result.get("asn_description")
-
         network = result.get("network") or {}
-        network_name = network.get("name")
-        network_cidr = network.get("cidr")
 
         return {
             "ip": ip,
-            "asn": asn,
-            "asn_description": asn_description,
-            "network_name": network_name,
-            "network_cidr": network_cidr
+            "asn": result.get("asn"),
+            "asn_description": result.get("asn_description"),
+            "network_name": network.get("name"),
+            "network_cidr": network.get("cidr"),
+            "network_country": network.get("country"),
+            "network_handle": network.get("handle")
         }
     except Exception as e:
         return {
@@ -275,6 +318,138 @@ def format_asn_summary(asn_data):
 
     return asn_data.get("note")
 
+def get_tor_exit_ips(force_refresh=False):
+    """
+    Fetch Tor exit list and cache it for 1 hour.
+    If fetch fails, return stale cache if available.
+    """
+    now = time.time()
+    cache_age = now - TOR_EXIT_CACHE["fetched_at"]
+
+    if not force_refresh and TOR_EXIT_CACHE["ips"] and cache_age < 3600:
+        return TOR_EXIT_CACHE["ips"]
+
+    try:
+        resp = requests.get(TOR_EXIT_LIST_URL, timeout=10)
+        resp.raise_for_status()
+        ips = {
+            line.strip()
+            for line in resp.text.splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+        TOR_EXIT_CACHE["ips"] = ips
+        TOR_EXIT_CACHE["fetched_at"] = now
+        TOR_EXIT_CACHE["error"] = None
+        return ips
+    except Exception as e:
+        TOR_EXIT_CACHE["error"] = type(e).__name__
+        return TOR_EXIT_CACHE["ips"]
+
+def is_tor_exit_node(ip):
+    if not ip or not is_public_ip(ip):
+        return None
+    tor_ips = get_tor_exit_ips()
+    if not tor_ips:
+        return None
+    return ip in tor_ips
+
+def classify_network(ip, asn_data):
+    """
+    Best-effort heuristic classification.
+    This is intentionally conservative and should be treated as a guess.
+    """
+    result = {
+        "network_type": "Unknown",
+        "confidence": "low",
+        "reasons": [],
+        "is_tor_exit": is_tor_exit_node(ip)
+    }
+
+    if not ip:
+        result["network_type"] = "Unavailable"
+        result["reasons"].append("No client IP available")
+        return result
+
+    if not is_public_ip(ip):
+        result["network_type"] = "Internal / reserved"
+        result["confidence"] = "high"
+        result["reasons"].append("IP is non-public or reserved")
+        return result
+
+    haystack = " ".join(
+        str(x or "")
+        for x in [
+            asn_data.get("asn_description") if asn_data else "",
+            asn_data.get("network_name") if asn_data else "",
+            asn_data.get("network_handle") if asn_data else "",
+        ]
+    ).lower()
+
+    if result["is_tor_exit"] is True:
+        result["network_type"] = "Tor exit node"
+        result["confidence"] = "high"
+        result["reasons"].append("IP appears in current Tor exit list")
+        return result
+
+    cloud_keywords = [
+        "amazon", "aws", "ec2", "microsoft", "azure", "google", "gcp",
+        "digitalocean", "linode", "akamai", "oracle", "ovh", "vultr",
+        "choopa", "hetzner", "alibaba", "tencent", "scaleway", "contabo"
+    ]
+    vpn_keywords = [
+        "vpn", "virtual private", "hosting", "datacenter", "data center",
+        "m247", "colo", "colocation", "anonymous", "anonymizer", "proxy"
+    ]
+    mobile_keywords = [
+        "wireless", "cellular", "mobile", "t-mobile", "verizon wireless",
+        "at&t mobility", "att mobility", "sprint", "us cellular"
+    ]
+    residential_keywords = [
+        "comcast", "xfinity", "charter", "spectrum", "cox", "optimum",
+        "frontier", "rogers", "shaw", "bell canada", "residential",
+        "consumer", "broadband", "cable", "fios"
+    ]
+    business_keywords = [
+        "business", "enterprise", "corp", "corporation", "university",
+        "college", "school district", "hospital", "bank", "government"
+    ]
+
+    if any(k in haystack for k in cloud_keywords):
+        result["network_type"] = "Cloud / hosting provider"
+        result["confidence"] = "medium"
+        result["reasons"].append("ASN/network name matches known cloud or hosting keywords")
+
+    if any(k in haystack for k in vpn_keywords):
+        result["network_type"] = "VPN / anonymizer likely"
+        result["confidence"] = "medium"
+        result["reasons"].append("ASN/network name contains VPN / hosting / proxy indicators")
+
+    if any(k in haystack for k in mobile_keywords):
+        result["network_type"] = "Mobile carrier"
+        result["confidence"] = "medium"
+        result["reasons"].append("ASN/network name matches mobile carrier indicators")
+
+    if any(k in haystack for k in residential_keywords):
+        result["network_type"] = "Residential / consumer ISP likely"
+        result["confidence"] = "medium"
+        result["reasons"].append("ASN/network name matches consumer ISP indicators")
+
+    if any(k in haystack for k in business_keywords):
+        result["network_type"] = "Business / enterprise network likely"
+        result["confidence"] = "low"
+        result["reasons"].append("ASN/network name contains enterprise-style terms")
+
+    if result["network_type"] == "Unknown":
+        if asn_data and (asn_data.get("asn_description") or asn_data.get("network_name")):
+            result["network_type"] = "Public network (type unclear)"
+            result["confidence"] = "low"
+            result["reasons"].append("Public IP with ASN ownership data, but no strong category match")
+
+    return result
+
+def get_request_headers_json():
+    return json.dumps(dict(request.headers), default=str)
+
 @app.route("/")
 @app.route("/documents/notice")
 def landing():
@@ -282,16 +457,20 @@ def landing():
 
     visit_id = str(uuid.uuid4())
     cookie_id = request.cookies.get("lab_id") or str(uuid.uuid4())
+
     client_ip = get_client_ip()
     asn_data = enrich_ip(client_ip)
+    classification = classify_network(client_ip, asn_data)
 
     with sqlite3.connect(DB) as conn:
         conn.execute("""
             INSERT INTO visits (
                 id, created_utc, path, query_string, client_ip,
-                x_forwarded_for, user_agent_header, accept_language,
-                referer_header, cookie_id, asn_json, client_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                x_forwarded_for, x_azure_clientip, remote_addr,
+                user_agent_header, accept_language, referer_header,
+                cookie_id, asn_json, network_classification_json,
+                client_json, headers_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             visit_id,
             datetime.now(timezone.utc).isoformat(),
@@ -299,12 +478,16 @@ def landing():
             request.query_string.decode("utf-8", errors="replace"),
             client_ip,
             request.headers.get("X-Forwarded-For"),
+            request.headers.get("X-Azure-ClientIP"),
+            request.remote_addr,
             request.headers.get("User-Agent"),
             request.headers.get("Accept-Language"),
             request.headers.get("Referer"),
             cookie_id,
             json.dumps(asn_data) if asn_data else None,
-            None
+            json.dumps(classification) if classification else None,
+            None,
+            get_request_headers_json()
         ))
         conn.commit()
 
@@ -320,6 +503,7 @@ def collect():
 
     client_ip = get_client_ip()
     asn_data = enrich_ip(client_ip)
+    classification = classify_network(client_ip, asn_data)
 
     with sqlite3.connect(DB) as conn:
         conn.execute("""
@@ -332,20 +516,25 @@ def collect():
     return jsonify({
         "ok": True,
         "client_ip": client_ip,
-        "asn_summary": format_asn_summary(asn_data)
+        "asn_summary": format_asn_summary(asn_data),
+        "network_type": classification.get("network_type") if classification else None,
+        "is_tor_exit": classification.get("is_tor_exit") if classification else None
     })
 
 @app.route("/admin/visits")
 def admin_visits():
-    # Protect this in production.
+    if request.args.get("token") != ADMIN_TOKEN:
+        abort(403)
+
     with sqlite3.connect(DB) as conn:
         rows = conn.execute("""
-            SELECT created_utc, client_ip, x_forwarded_for, user_agent_header,
-                   accept_language, referer_header, path, query_string,
-                   cookie_id, asn_json, client_json
+            SELECT created_utc, client_ip, x_forwarded_for, x_azure_clientip,
+                   remote_addr, user_agent_header, accept_language,
+                   referer_header, path, query_string, cookie_id,
+                   asn_json, network_classification_json, client_json, headers_json
             FROM visits
             ORDER BY created_utc DESC
-            LIMIT 100
+            LIMIT 200
         """).fetchall()
 
     out = []
@@ -354,17 +543,32 @@ def admin_visits():
             "created_utc": r[0],
             "client_ip": r[1],
             "x_forwarded_for": r[2],
-            "user_agent_header": r[3],
-            "accept_language": r[4],
-            "referer_header": r[5],
-            "path": r[6],
-            "query_string": r[7],
-            "cookie_id": r[8],
-            "asn": json.loads(r[9]) if r[9] else None,
-            "client_json": json.loads(r[10]) if r[10] else None
+            "x_azure_clientip": r[3],
+            "remote_addr": r[4],
+            "user_agent_header": r[5],
+            "accept_language": r[6],
+            "referer_header": r[7],
+            "path": r[8],
+            "query_string": r[9],
+            "cookie_id": r[10],
+            "asn": json.loads(r[11]) if r[11] else None,
+            "network_classification": json.loads(r[12]) if r[12] else None,
+            "client_json": json.loads(r[13]) if r[13] else None,
+            "headers": json.loads(r[14]) if r[14] else None
         })
 
     return jsonify(out)
+
+@app.route("/admin/tor-status")
+def tor_status():
+    if request.args.get("token") != ADMIN_TOKEN:
+        abort(403)
+
+    return jsonify({
+        "cached_count": len(TOR_EXIT_CACHE["ips"]),
+        "fetched_at_unix": TOR_EXIT_CACHE["fetched_at"],
+        "last_error": TOR_EXIT_CACHE["error"]
+    })
 
 if __name__ == "__main__":
     init_db()
